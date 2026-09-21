@@ -509,9 +509,14 @@ export class OpenAPIValidator<D extends Document = Document> {
    *
    * @param ajv The Ajv instance
    * @param schema The schema to compile
+   * @param prepare Optional callback invoked on the decycled deep copy of the schema before compilation.
+   * Allows callers to adjust the schema without mutating the original (potentially shared) definition.
    */
-  private static compileSchema(ajv: Ajv, schema: any): ValidateFunction {
+  private static compileSchema(ajv: Ajv, schema: any, prepare?: (schema: any) => void): ValidateFunction {
     const decycledSchema = this.decycle(schema);
+    if (prepare) {
+      prepare(decycledSchema);
+    }
     return ajv.compile(decycledSchema);
   }
 
@@ -616,9 +621,14 @@ export class OpenAPIValidator<D extends Document = Document> {
         }
 
         // add compiled params schema to schemas for this operation id
+        // removeBinaryPropertiesFromRequired is applied to the decycled copy so the dereferenced
+        // definition is never mutated
         const requestBodyValidator = this.getAjv(ValidationContext.RequestBody);
-        this.removeBinaryPropertiesFromRequired(requestBodySchema);
-        validators.push(OpenAPIValidator.compileSchema(requestBodyValidator, requestBodySchema));
+        validators.push(
+          OpenAPIValidator.compileSchema(requestBodyValidator, requestBodySchema, (schema) =>
+            this.removeBinaryPropertiesFromRequired(schema),
+          ),
+        );
       }
     }
 

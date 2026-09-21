@@ -4,8 +4,7 @@
 import * as _ from 'lodash';
 import type { Options as AjvOpts } from 'ajv';
 import OpenAPISchemaValidator from 'openapi-schema-validator';
-import { parse as parseJSONSchema, dereference } from './refparser';
-import { dereferenceSync } from 'dereference-json-schema';
+import { parse as parseJSONSchema } from './refparser';
 
 import { OpenAPIV3, OpenAPIV3_1 } from 'openapi-types';
 import { mock, SchemaLike } from 'mock-json-schema';
@@ -13,6 +12,8 @@ import { mock, SchemaLike } from 'mock-json-schema';
 import { OpenAPIRouter, Request, ParsedRequest, Operation, UnknownParams } from './router';
 import { OpenAPIValidator, ValidationResult, AjvCustomizer } from './validation';
 import OpenAPIUtils from './utils';
+import { DefinitionPlan, DefinitionPlanCache, computeDocumentKey, computePlanIdentity } from './plan';
+import { RequestContext } from './context';
 
 // alias Document to OpenAPIV3_1.Document
 export type Document = OpenAPIV3_1.Document | OpenAPIV3.Document;
@@ -107,6 +108,7 @@ export interface Options<D extends Document = Document> {
   securityHandlers?: HandlerMap;
   ignoreTrailingSlashes?: boolean;
   coerceTypes?: boolean;
+  planCache?: DefinitionPlanCache;
 }
 
 /**
@@ -162,6 +164,18 @@ export class OpenAPIBackend<D extends Document = Document> {
   public router: OpenAPIRouter<D>;
   public validator: OpenAPIValidator<D>;
 
+  /**
+   * The immutable compiled definition plan currently in use. Replaced atomically by init(); never
+   * mutated by request handling.
+   */
+  public plan: DefinitionPlan<D>;
+
+  /**
+   * Cache of compiled definition plans. Uses the shared cache passed via constructor options, or a
+   * private instance-local one. Never a global singleton.
+   */
+  public readonly planCache: DefinitionPlanCache;
+
   private warnings = new Set<string>();
 
   /**
@@ -192,6 +206,8 @@ export class OpenAPIBackend<D extends Document = Document> {
    * @param {boolean} opts.coerceTypes - enable coerce typing of request path and query parameters. Coercion happens as
    * part of validation, so it only applies to requests that get validated. (default: false)
    * @param {{ [operationId: string]: Handler | ErrorHandler }} opts.handlers - Operation handlers to be registered
+   * @param {DefinitionPlanCache} opts.planCache - (optional) shared cache for compiled definition plans. When
+   * provided, instances built from identical definitions and compile options reuse the same immutable plan.
    * @memberof OpenAPIBackend
    */
   constructor(opts: Options<D>) {
@@ -217,6 +233,7 @@ export class OpenAPIBackend<D extends Document = Document> {
     this.ajvOpts = optsWithDefaults.ajvOpts ?? {};
     this.customizeAjv = optsWithDefaults.customizeAjv;
     this.coerceTypes = optsWithDefaults.coerceTypes ?? false;
+    this.planCache = optsWithDefaults.planCache ?? new DefinitionPlanCache();
   }
 
   /**
@@ -228,63 +245,65 @@ export class OpenAPIBackend<D extends Document = Document> {
    * 4. Marks property `initialized` to true
    * 5. Registers all [Operation Handlers](#operation-handlers) passed in constructor options
    *
+   * Initialization is atomic: the immutable DefinitionPlan (dereferenced definition, route index and
+   * pre-compiled Ajv validators) is built on the side and swapped in only on success. If dereferencing
+   * or schema compilation fails, the previous plan keeps serving requests. Plans are cached by
+   * content-based identity, so re-initializing with an identical definition and identical compile
+   * options reuses the cached plan.
+   *
    * The init() method should be called right after creating a new instance of OpenAPIBackend
    *
    * @returns parent instance of OpenAPIBackend
    * @memberof OpenAPIBackend
    */
   public async init() {
-    try {
-      // parse the document
-      if (this.quick) {
-        // in quick mode we don't care when the document is ready
-        this.loadDocument();
-      } else {
-        await this.loadDocument();
-      }
+    const identity = this.computePlanIdentity();
+    let plan = this.planCache.get<D>(identity);
 
-      if (!this.quick) {
-        // validate the document
-        this.validateDefinition();
-      }
+    if (!plan) {
+      try {
+        // parse the document
+        if (this.quick) {
+          // in quick mode we don't care when the document is ready
+          this.loadDocument();
+        } else {
+          await this.loadDocument();
+        }
 
-      // dereference the document into definition (make sure not to copy)
-      if (typeof this.inputDocument === 'string') {
-        this.definition = (await dereference(this.inputDocument)) as D;
-      } else if (this.quick && typeof this.inputDocument === 'object') {
-        // use sync dereference in quick mode
-        this.definition = dereferenceSync(this.inputDocument) as D;
-      } else {
-        this.definition = (await dereference(this.document || this.inputDocument)) as D;
-      }
-    } catch (err) {
-      if (this.strict) {
-        // in strict-mode, fail hard and re-throw the error
-        throw err;
-      } else {
+        if (!this.quick) {
+          // validate the document
+          this.validateDefinition();
+        }
+
+        // dereference the document and build the immutable definition plan on the side
+        plan = await DefinitionPlan.build<D>({
+          identity,
+          inputDocument: this.inputDocument,
+          document: this.document,
+          apiRoot: this.apiRoot,
+          ignoreTrailingSlashes: this.ignoreTrailingSlashes,
+          validate: this.validate !== false,
+          ajvOpts: this.ajvOpts,
+          customizeAjv: this.customizeAjv,
+          coerceTypes: this.coerceTypes,
+          quick: this.quick,
+        });
+        this.planCache.set(plan);
+      } catch (err) {
+        if (this.strict) {
+          // in strict-mode, fail hard and re-throw the error
+          throw err;
+        }
         // just emit a warning about the validation errors
         console.warn(err);
+        // keep serving the previous plan if one exists; otherwise fall back to an empty plan so the
+        // instance stays usable, matching the historical non-strict behavior
+        plan = this.plan ?? this.buildFallbackPlan(identity);
       }
     }
 
-    // initialize router with dereferenced definition
-    this.router = new OpenAPIRouter({
-      definition: this.definition,
-      apiRoot: this.apiRoot,
-      ignoreTrailingSlashes: this.ignoreTrailingSlashes,
-    });
-
-    // initialize validator with dereferenced definition
-    if (this.validate !== false) {
-      this.validator = new OpenAPIValidator({
-        definition: this.definition,
-        ajvOpts: this.ajvOpts,
-        customizeAjv: this.customizeAjv,
-        router: this.router,
-        lazyCompileValidators: Boolean(this.quick), // optimise startup by lazily compiling Ajv validators
-        coerceTypes: this.coerceTypes,
-      });
-    }
+    // swap the plan in atomically
+    this.applyPlan(plan);
 
     // we are initialized
     this.initialized = true;
@@ -305,6 +324,69 @@ export class OpenAPIBackend<D extends Document = Document> {
 
     // return this instance
     return this;
+  }
+
+  /**
+   * Computes the content-based identity of the definition plan for the current constructor options
+   *
+   * The document part of the identity is always derived from the current document content, never from
+   * an object reference, so mutating the input document and re-initializing produces a fresh plan.
+   *
+   * @returns {string} plan identity
+   * @memberof OpenAPIBackend
+   */
+  private computePlanIdentity(): string {
+    return computePlanIdentity({
+      documentKey: computeDocumentKey(this.inputDocument),
+      apiRoot: this.apiRoot,
+      ignoreTrailingSlashes: this.ignoreTrailingSlashes,
+      validate: this.validate !== false,
+      ajvOpts: this.ajvOpts,
+      customizeAjv: this.customizeAjv,
+      coerceTypes: this.coerceTypes,
+      quick: this.quick,
+    });
+  }
+
+  /**
+   * Builds a degraded plan over an undefined definition, used when initialization fails in non-strict
+   * mode before any plan was successfully built
+   *
+   * @param {string} identity - plan identity
+   * @returns {DefinitionPlan<D>}
+   * @memberof OpenAPIBackend
+   */
+  private buildFallbackPlan(identity: string): DefinitionPlan<D> {
+    return DefinitionPlan.fromDefinition<D>(this.definition, {
+      identity,
+      inputDocument: this.inputDocument,
+      apiRoot: this.apiRoot,
+      ignoreTrailingSlashes: this.ignoreTrailingSlashes,
+      validate: this.validate !== false,
+      ajvOpts: this.ajvOpts,
+      customizeAjv: this.customizeAjv,
+      coerceTypes: this.coerceTypes,
+      quick: this.quick,
+    });
+  }
+
+  /**
+   * Atomically swaps the active definition plan and syncs the public router / validator / definition
+   * references from it
+   *
+   * @param {DefinitionPlan<D>} plan
+   * @memberof OpenAPIBackend
+   */
+  private applyPlan(plan: DefinitionPlan<D>): void {
+    this.plan = plan;
+    this.definition = plan.definition;
+    this.router = plan.router;
+    if (plan.validator) {
+      this.validator = plan.validator;
+    }
+    if (!this.document) {
+      this.document = plan.definition;
+    }
   }
 
   /**
@@ -334,50 +416,62 @@ export class OpenAPIBackend<D extends Document = Document> {
       await this.init();
     }
 
-    // initialize context object with a reference to this OpenAPIBackend instance
-    const context: Partial<Context<any, any, any, any, any, D>> = { api: this };
+    // create a short-lived request context: snapshots the handler registries (consistent generation
+    // for the whole request) and binds the immutable definition plan. All mutable per-request state
+    // (matched operation, Ajv validation results, security results) lives on this context and is
+    // discarded when the request completes, so concurrent requests never observe each other's state.
+    const requestContext = new RequestContext<D>({
+      api: this,
+      plan: this.plan,
+      handlers: this.handlers,
+      securityHandlers: this.securityHandlers,
+    });
+    const context = requestContext.asContext();
+    const plan = requestContext.plan;
+    const handlers = requestContext.handlers;
+    const securityHandlers = requestContext.securityHandlers;
 
     // handle request with correct handler
     const response: any = await (async () => {
       // parse request
-      context.request = this.router.parseRequest(req);
+      context.request = plan.router.parseRequest(req);
 
       // preRoutingHandler
-      const preRoutingHandler = this.handlers['preRoutingHandler'];
+      const preRoutingHandler = handlers['preRoutingHandler'];
       if (preRoutingHandler) {
-        await preRoutingHandler(context as Context<D>, ...handlerArgs);
+        await preRoutingHandler(context, ...handlerArgs);
       }
 
       // match operation (routing)
       try {
-        context.operation = this.router.matchOperation(req, true);
+        context.operation = plan.router.matchOperation(req, true);
       } catch (err) {
         // postRoutingHandler on routing failure
-        const postRoutingHandler = this.handlers['postRoutingHandler'];
+        const postRoutingHandler = handlers['postRoutingHandler'];
         if (postRoutingHandler) {
-          await postRoutingHandler(context as Context<D>, ...handlerArgs);
+          await postRoutingHandler(context, ...handlerArgs);
         }
 
-        let handler = this.handlers['404'] || this.handlers['notFound'];
+        let handler = handlers['404'] || handlers['notFound'];
         if (err instanceof Error && err.message.startsWith('405')) {
           // 405 method not allowed
-          handler = this.handlers['405'] || this.handlers['methodNotAllowed'] || handler;
+          handler = handlers['405'] || handlers['methodNotAllowed'] || handler;
         }
         if (!handler) {
           throw err;
         }
-        return handler(context as Context<D>, ...handlerArgs);
+        return handler(context, ...handlerArgs);
       }
 
       const operationId = context.operation.operationId as string;
 
       // parse request again now with matched operation
-      context.request = this.router.parseRequest(req, context.operation);
+      context.request = plan.router.parseRequest(req, context.operation);
 
       // postRoutingHandler on routing success
-      const postRoutingHandler = this.handlers['postRoutingHandler'];
+      const postRoutingHandler = handlers['postRoutingHandler'];
       if (postRoutingHandler) {
-        await postRoutingHandler(context as Context<D>, ...handlerArgs);
+        await postRoutingHandler(context, ...handlerArgs);
       }
 
       // get security requirements for the matched operation
@@ -390,11 +484,11 @@ export class OpenAPIBackend<D extends Document = Document> {
       await Promise.all(
         securitySchemes.map(async (name) => {
           securityHandlerResults[name] = undefined;
-          if (this.securityHandlers[name]) {
-            const securityHandler = this.securityHandlers[name];
+          if (securityHandlers[name]) {
+            const securityHandler = securityHandlers[name];
             // return a promise that will set the security handler result
             return await Promise.resolve()
-              .then(() => securityHandler(context as Context<D>, ...handlerArgs))
+              .then(() => securityHandler(context, ...handlerArgs))
               .then((result: unknown) => {
                 securityHandlerResults[name] = result;
               })
@@ -452,16 +546,16 @@ export class OpenAPIBackend<D extends Document = Document> {
       };
 
       // postSecurityHandler
-      const postSecurityHandler = this.handlers['postSecurityHandler'];
+      const postSecurityHandler = handlers['postSecurityHandler'];
       if (postSecurityHandler) {
-        await postSecurityHandler(context as Context<D>, ...handlerArgs);
+        await postSecurityHandler(context, ...handlerArgs);
       }
 
       // call unauthorizedHandler handler if auth fails
       if (!authorized && securityRequirements.length > 0) {
-        const unauthorizedHandler = this.handlers['unauthorizedHandler'];
+        const unauthorizedHandler = handlers['unauthorizedHandler'];
         if (unauthorizedHandler) {
-          return unauthorizedHandler(context as Context<D>, ...handlerArgs);
+          return unauthorizedHandler(context, ...handlerArgs);
         }
         if (this.strict) {
           // strict mode: fail closed
@@ -481,18 +575,16 @@ export class OpenAPIBackend<D extends Document = Document> {
 
       // check whether this request should be validated
       const validate =
-        typeof this.validate === 'function'
-          ? this.validate(context as Context<D>, ...handlerArgs)
-          : Boolean(this.validate);
+        typeof this.validate === 'function' ? this.validate(context, ...handlerArgs) : Boolean(this.validate);
 
       // validate request
-      const validationFailHandler = this.handlers['400'] || this.handlers['validationFail'];
+      const validationFailHandler = handlers['400'] || handlers['validationFail'];
       if (validate) {
-        context.validation = this.validator.validateRequest(req, context.operation);
+        context.validation = plan.validator.validateRequest(req, context.operation);
         if (context.validation.errors) {
           // 400 request validation fail
           if (validationFailHandler) {
-            return validationFailHandler(context as Context<D>, ...handlerArgs);
+            return validationFailHandler(context, ...handlerArgs);
           }
           if (this.strict) {
             // strict mode: fail closed
@@ -511,38 +603,38 @@ export class OpenAPIBackend<D extends Document = Document> {
         }
 
         // parse request again now with coerced types, if needed
-        if (this.validator.coerceTypes) {
-          context.request = this.router.parseRequest(context.validation.coerced, context.operation);
+        if (plan.validator.coerceTypes) {
+          context.request = plan.router.parseRequest(context.validation.coerced, context.operation);
         }
       }
 
       // preOperationHandler – runs just before the operation handler
-      const preOperationHandler = this.handlers['preOperationHandler'];
+      const preOperationHandler = handlers['preOperationHandler'];
       if (preOperationHandler) {
-        await preOperationHandler(context as Context<D>, ...handlerArgs);
+        await preOperationHandler(context, ...handlerArgs);
       }
 
       // get operation handler
-      const operationHandler = this.handlers[operationId];
+      const operationHandler = handlers[operationId];
       if (!operationHandler) {
         // 501 not implemented
-        const notImplementedHandler = this.handlers['501'] || this.handlers['notImplemented'];
+        const notImplementedHandler = handlers['501'] || handlers['notImplemented'];
         if (!notImplementedHandler) {
           throw Error(`501-notImplemented: ${operationId} no handler registered`);
         }
-        return notImplementedHandler(context as Context<D>, ...handlerArgs);
+        return notImplementedHandler(context, ...handlerArgs);
       }
 
       // handle route
-      return operationHandler(context as Context<D>, ...handlerArgs);
+      return operationHandler(context, ...handlerArgs);
     }).bind(this)();
 
     // post response handler
-    const postResponseHandler = this.handlers['postResponseHandler'];
+    const postResponseHandler = handlers['postResponseHandler'];
     if (postResponseHandler) {
       // pass response to postResponseHandler
       context.response = response;
-      return postResponseHandler(context as Context<D>, ...handlerArgs);
+      return postResponseHandler(context, ...handlerArgs);
     }
 
     // return response
